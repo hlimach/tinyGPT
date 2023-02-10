@@ -80,10 +80,14 @@ class Block(nn.Module):
 
         self.self_attn_heads = MultiHeads(n_embd, block_size, n_heads, head_size)
         self.feedfwd = FeedForward(n_embd)
+
+        # for pre-norm formulation
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
     
     def forward(self, x):
-        x = x + self.self_attn_heads(x) # (B, T, C)
-        out = x + self.feedfwd(x) # (B, T, C)
+        x = x + self.self_attn_heads(self.ln1(x)) # (B, T, C)
+        out = x + self.feedfwd(self.ln2(x)) # (B, T, C)
         return out
 
 
@@ -105,6 +109,7 @@ class GPTLanguageModel(nn.Module):
             Block(self.n_embd, self.n_heads, self.block_size),
             Block(self.n_embd, self.n_heads, self.block_size),
             Block(self.n_embd, self.n_heads, self.block_size),
+            nn.LayerNorm(self.n_embd),
         )
 
         self.lm_head = nn.Linear(self.n_embd, self.vocab_size)
