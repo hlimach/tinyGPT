@@ -5,13 +5,14 @@ from torch.nn import functional as F
 class Head(nn.Module):
     """ single self-attention head"""
 
-    def __init__(self, n_embd, block_size, head_size):
+    def __init__(self, n_embd, block_size, head_size, dropout):
         super().__init__()
 
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
         B, T, C = x.shape
@@ -31,8 +32,9 @@ class Head(nn.Module):
         # change all zeroes in tril to -inf
         w = w.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
 
-        # compute softmax on each row
+        # compute softmax on each row and dropout
         w = F.softmax(w, dim=-1) # (B, T, T)
+        w = self.dropout(w)
 
         # weighted aggregation of values
         out = w @ v # (B, T, T) @ (B, T, C) -> (B, T, C)
@@ -43,28 +45,30 @@ class Head(nn.Module):
 class MultiHeads(nn.Module):
     """ multiple self-attention heads in parallel for communication"""
 
-    def __init__(self, n_embd, block_size, n_heads, head_size):
+    def __init__(self, n_embd, block_size, head_size, dropout, n_heads):
         super().__init__()
 
-        self.heads = nn.ModuleList([Head(n_embd, block_size, head_size) for _ in range(n_heads)])
+        self.heads = nn.ModuleList([Head(n_embd, block_size, head_size, dropout) for _ in range(n_heads)])
         self.projection = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
         x = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.projection(x)
+        out = self.dropout(self.projection(x))
         return out
 
 
 class FeedForward(nn.Module):
     """ simple feedforward block for computation"""
 
-    def __init__(self, n_embd):
+    def __init__(self, n_embd, dropout):
         super().__init__()
 
         self.feed = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
             nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
         )
     
     def forward(self, x):
@@ -74,12 +78,12 @@ class FeedForward(nn.Module):
 class Block(nn.Module):
     """ transformer block for communication then computation"""
 
-    def __init__(self, n_embd, n_heads, block_size):
+    def __init__(self, n_embd, block_size, dropout, n_heads):
         super().__init__()
         head_size = n_embd // n_heads
 
-        self.self_attn_heads = MultiHeads(n_embd, block_size, n_heads, head_size)
-        self.feedfwd = FeedForward(n_embd)
+        self.self_attn_heads = MultiHeads(n_embd, block_size, head_size, dropout, n_heads)
+        self.feedfwd = FeedForward(n_embd, dropout)
 
         # for pre-norm formulation
         self.ln1 = nn.LayerNorm(n_embd)
@@ -98,6 +102,8 @@ class GPTLanguageModel(nn.Module):
 
         self.vocab_size = params['vocab_size']
         self.block_size = params['block_size']
+        self.n_layers = params['n_layers']
+        self.dropout = params['dropout']
         self.n_heads = params['n_heads']
         self.n_embd = params['n_embd']
         self.device = params['device']
@@ -106,12 +112,10 @@ class GPTLanguageModel(nn.Module):
         self.pos_embedding_table = nn.Embedding(self.block_size, self.n_embd)
 
         self.transformer = nn.Sequential(
-            Block(self.n_embd, self.n_heads, self.block_size),
-            Block(self.n_embd, self.n_heads, self.block_size),
-            Block(self.n_embd, self.n_heads, self.block_size),
-            nn.LayerNorm(self.n_embd),
+            *[Block(self.n_embd, self.block_size, self.dropout, self.n_heads) for _ in range(self.n_layers)]
         )
 
+        self.ln = nn.LayerNorm(self.n_embd)
         self.lm_head = nn.Linear(self.n_embd, self.vocab_size)
 
     def forward(self, idx, target=None):
@@ -122,7 +126,7 @@ class GPTLanguageModel(nn.Module):
         pos_emb = self.pos_embedding_table(torch.arange(T, device=self.device)) # (T, C)
 
         x = tok_emb + pos_emb # (B, T, C)
-        x = self.transformer(x) # (B, T, C)
+        x = self.ln(self.transformer(x)) # (B, T, C)
         logits = self.lm_head(x) # (B, T, vocab_size)
 
         if target is None:
